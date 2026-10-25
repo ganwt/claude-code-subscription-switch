@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""claude-switch: switch Claude Code between subscription (Max/Team) and an Anthropic API key.
+
+Mechanism (all official Claude Code extension points, see docs/01-调查与方案.md):
+  * statusLine command  -> receives rate_limits / cost / session_id after every response
+  * apiKeyHelper        -> present in ~/.claude/settings.json only while in API mode;
+                           settings.json is hot-reloaded, so running sessions switch too
+  * StopFailure hook    -> fallback signal for usage-limit errors, and emergency stop on
+                           API auth/billing errors
+  * Stop hook           -> cheap periodic re-check for sessions without a status line
+"""
+import datetime as dt
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+SWITCH_HOME = os.environ.get("CLAUDE_SWITCH_HOME") or os.path.join(HOME, ".config", "claude-switch")
+SETTINGS_PATH = os.environ.get("CLAUDE_SWITCH_SETTINGS") or os.path.join(HOME, ".claude", "settings.json")
+BACKUP_DIR = os.environ.get("CLAUDE_SWITCH_BACKUP_DIR") or os.path.join(HOME, ".claude", "backups", "claude-switch")
+CLAUDE_BIN = os.environ.get("CLAUDE_SWITCH_CLAUDE_BIN") or "claude"
+# "now" can be overridden for tests
+NOW = float(os.environ["CLAUDE_SWITCH_NOW"]) if os.environ.get("CLAUDE_SWITCH_NOW") else None
+
+STATE_PATH = os.path.join(SWITCH_HOME, "state.json")
+CONFIG_PATH = os.path.join(SWITCH_HOME, "config.json")
+KEY_PATH = os.path.join(SWITCH_HOME, "api_key")
+LOCK_PATH = os.path.join(SWITCH_HOME, ".lock")
+LOG_PATH = os.path.join(SWITCH_HOME, "log", "switch.log")
+COST_LOG_PATH = os.path.join(SWITCH_HOME, "log", "api-cost.jsonl")
+
+DEFAULT_CONFIG = {
+    # switch to API when a subscription window reaches this used_percentage
+    "switch_pct": 95,
+    # a StopFailure rate_limit counts as exhaustion only if the last known usage is at least
+    # this high, or if usage data is older than usage_stale_sec (e.g. extension-only sessions)
+    "rate_limit_guard_pct": 80,
+    "usage_stale_sec": 900,
+    # minimum seconds between two switches (anti-flapping)
+    "cooldown_sec": 600,
+    # soft spend limits for API mode (client-side estimate, NOT a hard cap)
+    "api_daily_limit_usd": 5.0,
+    "api_monthly_limit_usd": 50.0,
+}
+
+DEFAULT_STATE = {
+    "mode": "auto",            # auto | max | api  (max/api = forced)
+    "effective": "max",        # what the settings currently select
+    "api_blocked": False,      # set after an API error / spend limit; cleared by set-mode
+    "api_blocked_reason": None,
+    "max_recover_at": None,    # epoch seconds when the exhausted window resets
+    "switched_at": 0,
+    "usage": {},               # {"five_hour": {"pct":..,"resets_at":..}, "seven_day": {...}}
+    "usage_at": 0,
+    "sessions": {},            # session_id -> {"cost": last total, "seen": epoch}
+    "api_spend": {},           # "YYYY-MM-DD" -> usd
+}
+
+
+def now():
+    return NOW if NOW is not None else time.time()
+
+
+def today(ts=None):
+    return dt.datetime.fromtimestamp(ts or now()).strftime("%Y-%m-%d")
+
+
+def fmt_time(ts):
+    if not ts:
+        return "?"
+    d = dt.datetime.fromtimestamp(ts)
+    return d.strftime("%H:%M") if d.date() == dt.datetime.fromtimestamp(now()).date() else d.strftime("%a %H:%M")
+
+
+def ensure_dirs():
+    os.makedirs(os.path.join(SWITCH_HOME, "log"), exist_ok=True)
+    os.chmod(SWITCH_HOME, 0o700)
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return json.loads(json.dumps(default))
+    except json.JSONDecodeError as e:
+        sys.exit(f"claude-switch: {path} is not valid JSON: {e}")
+
+
+def write_json_atomic(path, data, mode=0o600):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(read_json(CONFIG_PATH, {}))
+    return cfg
+
+
+def load_state():
+    st = json.loads(json.dumps(DEFAULT_STATE))
+    st.update(read_json(STATE_PATH, {}))
+    return st
+
+
+def save_state(st):
+    write_json_atomic(STATE_PATH, st)
+
+
+def log(msg):
+    ensure_dirs()
+    line = f"{dt.datetime.fromtimestamp(now()).strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+class Locked:
+    """Serialize state/settings mutation across concurrent statusline/hook invocations."""
+
+    def __enter__(self):
+        ensure_dirs()
+        self.f = open(LOCK_PATH, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+# ---------------------------------------------------------------- settings.json
+
+def self_path():
+    return os.path.realpath(sys.argv[0])
+
+
+def backup_settings():
+    if not os.path.exists(SETTINGS_PATH):
+        return None
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, "settings-%s.json" % dt.datetime.fromtimestamp(now()).strftime("%Y%m%d-%H%M%S"))
+    shutil.copy2(SETTINGS_PATH, dest)
+    # keep the 20 most recent backups
+    olds = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("settings-"))
+    for f in olds[:-20]:
+        os.remove(os.path.join(BACKUP_DIR, f))
+    return dest
+
+
+def write_settings(settings):
+    backup_settings()
+    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+    write_json_atomic(SETTINGS_PATH, settings, mode=0o644)
+
+
+def helper_cmd():
+    return f"{self_path()} api-key"
+
+
+def apply_effective(st, want, reason):
+    """Add or remove apiKeyHelper so that Claude Code uses the wanted credential. Returns True if changed."""
+    settings = read_json(SETTINGS_PATH, {})
+    has_helper = settings.get("apiKeyHelper") == helper_cmd()
+    if want == "api":
+        if not os.path.exists(KEY_PATH):
+            log(f"REFUSED switch to api ({reason}): no key at {KEY_PATH}")
+            return False
+        if has_helper and st["effective"] == "api":
+            return False
+        settings["apiKeyHelper"] = helper_cmd()
+    else:
+        if not has_helper and st["effective"] == "max":
+            return False
+        settings.pop("apiKeyHelper", None)
+    write_settings(settings)
+    prev = st["effective"]
+    st["effective"] = want
+    st["switched_at"] = now()
+    log(f"SWITCH {prev} -> {want} ({reason})")
+    verify_async(want)
+    return True
+
+
+def verify_async(want):
+    """Confirm, from a fresh process, which credential Claude Code now resolves. Logged, not blocking."""
+    script = (
+        "import json,subprocess,sys\n"
+        "try:\n"
+        f" out=subprocess.run([{CLAUDE_BIN!r},'auth','status'],capture_output=True,text=True,timeout=20).stdout\n"
+        " m=json.loads(out).get('authMethod')\n"
+        "except Exception as e:\n"
+        " m='error: '+str(e)\n"
+        f"want={'api_key_helper' if want == 'api' else 'claude.ai'!r}\n"
+        f"open({LOG_PATH!r},'a').write(__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')+' VERIFY auth status = '+str(m)+(' OK' if m==want else ' MISMATCH, expected '+want)+'\\n')\n"
+    )
+    try:
+        subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- decision logic
+
+def spend(st, period):
+    if period == "day":
+        return st["api_spend"].get(today(), 0.0)
+    month = today()[:7]
+    return sum(v for k, v in st["api_spend"].items() if k.startswith(month))
+
+
+def exhausted_windows(st, cfg):
+    return {k: v for k, v in st["usage"].items() if v.get("pct", 0) >= cfg["switch_pct"]}
+
+
+def evaluate(st, cfg, trigger):
+    """Decide the wanted credential and apply it. Called with the lock held."""
+    if st["mode"] == "max":
+        return apply_effective(st, "max", f"forced max [{trigger}]")
+    if st["api_blocked"]:
+        # an API auth/billing error or spend limit wins even over forced api
+        return apply_effective(st, "max", f"api blocked: {st['api_blocked_reason']} [{trigger}]")
+    if st["mode"] == "api":
+        return apply_effective(st, "api", f"forced api [{trigger}]")
+
+    t = now()
+    in_cooldown = t - st["switched_at"] < cfg["cooldown_sec"]
+
+    if st["effective"] == "api":
+        if not os.path.exists(KEY_PATH):
+            return apply_effective(st, "max", f"api key file missing [{trigger}]")
+        if not st["max_recover_at"]:
+            # auto mode entered from a forced API state: nothing to wait for
+            return apply_effective(st, "max", f"no subscription reset pending [{trigger}]")
+        if spend(st, "day") >= cfg["api_daily_limit_usd"]:
+            block_api(st, f"daily API spend {spend(st, 'day'):.2f} >= {cfg['api_daily_limit_usd']} USD")
+            return apply_effective(st, "max", f"{st['api_blocked_reason']} [{trigger}]")
+        if spend(st, "month") >= cfg["api_monthly_limit_usd"]:
+            block_api(st, f"monthly API spend {spend(st, 'month'):.2f} >= {cfg['api_monthly_limit_usd']} USD")
+            return apply_effective(st, "max", f"{st['api_blocked_reason']} [{trigger}]")
+        if st["max_recover_at"] and t >= st["max_recover_at"] and not in_cooldown:
+            st["max_recover_at"] = None
+            # forget stale usage so the next subscription response decides afresh
+            st["usage"] = {}
+            return apply_effective(st, "max", f"subscription window reset [{trigger}]")
+        return False
+
+    # effective == max
+    ex = exhausted_windows(st, cfg)
+    if ex and not st["api_blocked"]:
+        resets = [v.get("resets_at") or 0 for v in ex.values()]
+        st["max_recover_at"] = max(resets) if any(resets) else t + 5 * 3600
+        desc = ", ".join(f"{k}={v.get('pct')}%" for k, v in ex.items())
+        return apply_effective(st, "api", f"subscription exhausted: {desc}, recover at {fmt_time(st['max_recover_at'])} [{trigger}]")
+    return False
+
+
+def block_api(st, reason):
+    st["api_blocked"] = True
+    st["api_blocked_reason"] = reason
+    log(f"API BLOCKED: {reason} (run 'claude-switch set-mode auto' to clear)")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_statusline():
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        data = {}
+    cfg = load_config()
+    with Locked():
+        st = load_state()
+        rl = data.get("rate_limits") or {}
+        windows = {}
+        for w in ("five_hour", "seven_day"):
+            if isinstance(rl.get(w), dict) and rl[w].get("used_percentage") is not None:
+                windows[w] = {"pct": rl[w]["used_percentage"], "resets_at": rl[w].get("resets_at")}
+        # rate_limits only arrive while on the subscription; never let API-mode data clear them
+        if windows and st["effective"] == "max":
+            st["usage"] = windows
+            st["usage_at"] = now()
+        sid = data.get("session_id")
+        cost = (data.get("cost") or {}).get("total_cost_usd")
+        if sid and cost is not None:
+            prev = st["sessions"].get(sid, {}).get("cost", 0.0)
+            delta = cost - prev
+            if delta > 0 and st["effective"] == "api":
+                st["api_spend"][today()] = round(st["api_spend"].get(today(), 0.0) + delta, 6)
+                with open(COST_LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"ts": int(now()), "session_id": sid, "delta_usd": round(delta, 6),
+                                        "session_total_usd": cost, "model": (data.get("model") or {}).get("id")}) + "\n")
+            st["sessions"][sid] = {"cost": cost, "seen": int(now())}
+            # drop sessions not seen for 7 days
+            st["sessions"] = {k: v for k, v in st["sessions"].items() if now() - v["seen"] < 7 * 86400}
+        evaluate(st, cfg, "statusline")
+        save_state(st)
+    print(render(st, cfg))
+
+
+def render(st, cfg):
+    parts = []
+    tag = {"auto": "", "max": " (forced)", "api": " (forced)"}[st["mode"]]
+    if st["effective"] == "max":
+        parts.append("\033[32mMAX\033[0m" + tag)
+        for w, label in (("five_hour", "5h"), ("seven_day", "7d")):
+            u = st["usage"].get(w)
+            if u:
+                parts.append(f"{label} {u['pct']}% ↻{fmt_time(u.get('resets_at'))}")
+        if st["api_blocked"]:
+            parts.append("\033[31mAPI blocked\033[0m")
+    else:
+        parts.append("\033[33mAPI\033[0m" + tag)
+        parts.append(f"today ${spend(st, 'day'):.2f}/{cfg['api_daily_limit_usd']:.0f}")
+        if st["max_recover_at"]:
+            parts.append(f"Max back ↻{fmt_time(st['max_recover_at'])}")
+    return " · ".join(parts)
+
+
+def cmd_on_stop_failure():
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return
+    err = data.get("error") or "unknown"
+    detail = (data.get("last_assistant_message") or data.get("error_details") or "")[:200].replace("\n", " ")
+    cfg = load_config()
+    with Locked():
+        st = load_state()
+        log(f"STOPFAILURE error={err} effective={st['effective']} detail={detail!r}")
+        if st["effective"] == "api" and err in ("authentication_failed", "billing_error", "account_on_hold", "invalid_request"):
+            block_api(st, f"API error {err}")
+            evaluate(st, cfg, "stop-failure")
+        elif st["effective"] == "max" and st["mode"] == "auto" and err == "rate_limit":
+            stale = now() - st["usage_at"] > cfg["usage_stale_sec"]
+            high = any(v.get("pct", 0) >= cfg["rate_limit_guard_pct"] for v in st["usage"].values())
+            if stale or high:
+                # trust the error: mark every known window exhausted so evaluate() switches
+                if not st["usage"]:
+                    st["usage"] = {"five_hour": {"pct": 100, "resets_at": None}}
+                for v in st["usage"].values():
+                    v["pct"] = max(v.get("pct", 0), 100)
+                st["usage_at"] = now()
+                evaluate(st, cfg, f"stop-failure rate_limit{' (usage data stale)' if stale else ''}")
+            else:
+                log("rate_limit ignored: last known usage below guard threshold")
+        save_state(st)
+
+
+def cmd_check(quiet=False):
+    cfg = load_config()
+    with Locked():
+        st = load_state()
+        changed = evaluate(st, cfg, "check")
+        save_state(st)
+    if not quiet:
+        print("switched" if changed else "no change")
+
+
+def cmd_api_key():
+    st = load_state()
+    if st["effective"] != "api":
+        # helper should not even be configured in this state; refuse so Max is never billed as API
+        sys.stderr.write("claude-switch: not in API mode, refusing to output key\n")
+        sys.exit(1)
+    try:
+        mode = os.stat(KEY_PATH).st_mode & 0o777
+        if mode & 0o077:
+            sys.stderr.write(f"claude-switch: {KEY_PATH} is group/world readable (chmod 600 it)\n")
+        with open(KEY_PATH, encoding="utf-8") as f:
+            key = f.read().strip()
+    except OSError as e:
+        log(f"api-key helper failed: {e}")
+        sys.exit(1)
+    if not key:
+        log("api-key helper failed: key file empty")
+        sys.exit(1)
+    sys.stdout.write(key)
+
+
+def cmd_set_key():
+    ensure_dirs()
+    if sys.stdin.isatty():
+        import getpass
+        key = getpass.getpass("Anthropic API key (input hidden): ")
+    else:
+        key = sys.stdin.read()
+    key = key.strip()
+    if not key.startswith("sk-ant-"):
+        sys.exit("claude-switch: that does not look like an Anthropic API key (sk-ant-...)")
+    fd = os.open(KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key + "\n")
+    os.chmod(KEY_PATH, 0o600)
+    print(f"key stored in {KEY_PATH} (0600)")
+
+
+def cmd_set_mode(mode):
+    if mode not in ("auto", "max", "api"):
+        sys.exit("usage: claude-switch set-mode auto|max|api")
+    cfg = load_config()
+    with Locked():
+        st = load_state()
+        st["mode"] = mode
+        if st["api_blocked"]:
+            log(f"API block cleared by set-mode {mode}")
+        st["api_blocked"] = False
+        st["api_blocked_reason"] = None
+        log(f"MODE -> {mode}")
+        evaluate(st, cfg, "set-mode")
+        save_state(st)
+    print(f"mode={mode} effective={st['effective']}")
+
+
+def cmd_status():
+    cfg = load_config()
+    st = load_state()
+    settings = read_json(SETTINGS_PATH, {})
+    print(f"mode:            {st['mode']}")
+    print(f"effective:       {st['effective']}")
+    print(f"apiKeyHelper:    {'present' if settings.get('apiKeyHelper') == helper_cmd() else 'absent'}"
+          + (f"  (foreign value: {settings['apiKeyHelper']!r})" if settings.get("apiKeyHelper") not in (None, helper_cmd()) else ""))
+    print(f"statusLine hook: {'installed' if (settings.get('statusLine') or {}).get('command', '').startswith(self_path()) else 'NOT installed'}")
+    print(f"api key file:    {'present' if os.path.exists(KEY_PATH) else 'MISSING'} ({KEY_PATH})")
+    for w, label in (("five_hour", "5-hour"), ("seven_day", "7-day")):
+        u = st["usage"].get(w)
+        print(f"{label + ' usage:':17}" + (f"{u['pct']}% (resets {fmt_time(u.get('resets_at'))})" if u else "unknown"))
+    if st["usage_at"]:
+        print(f"usage seen at:   {dt.datetime.fromtimestamp(st['usage_at']).strftime('%Y-%m-%d %H:%M:%S')}")
+    if st["max_recover_at"]:
+        print(f"max recover at:  {dt.datetime.fromtimestamp(st['max_recover_at']).strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"API spend today: ${spend(st, 'day'):.4f} (soft limit {cfg['api_daily_limit_usd']})")
+    print(f"API spend month: ${spend(st, 'month'):.4f} (soft limit {cfg['api_monthly_limit_usd']})")
+    if st["api_blocked"]:
+        print(f"API BLOCKED:     {st['api_blocked_reason']}  -> 'claude-switch set-mode auto' to clear")
+    try:
+        out = subprocess.run([CLAUDE_BIN, "auth", "status"], capture_output=True, text=True, timeout=20).stdout
+        print(f"claude auth:     {json.loads(out).get('authMethod')} (fresh process)")
+    except Exception as e:  # noqa: BLE001
+        print(f"claude auth:     unavailable ({e})")
+
+
+def cmd_log(n):
+    try:
+        with open(LOG_PATH, encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+    sys.stdout.write("".join(lines[-n:]))
+
+
+def cmd_install():
+    ensure_dirs()
+    if not os.path.exists(CONFIG_PATH):
+        write_json_atomic(CONFIG_PATH, DEFAULT_CONFIG)
+    me = self_path()
+    with Locked():
+        st = load_state()
+        settings = read_json(SETTINGS_PATH, {})
+        if settings.get("statusLine") and not (settings["statusLine"].get("command") or "").startswith(me):
+            print(f"note: replacing existing statusLine {settings['statusLine']!r} (backup kept)")
+        settings["statusLine"] = {"type": "command", "command": f"{me} statusline", "refreshInterval": 60}
+        hooks = settings.setdefault("hooks", {})
+        for event, sub in (("StopFailure", "on-stop-failure"), ("Stop", "check --quiet")):
+            entries = [h for h in hooks.get(event, []) if not any(me in (c.get("command") or "") for c in h.get("hooks", []))]
+            entries.append({"hooks": [{"type": "command", "command": f"{me} {sub}", "timeout": 20}]})
+            hooks[event] = entries
+        if settings.get("apiKeyHelper") not in (None, helper_cmd()):
+            print(f"warning: a foreign apiKeyHelper is set ({settings['apiKeyHelper']!r}); it would override the subscription. Not touching it.")
+        elif settings.get("apiKeyHelper"):
+            settings.pop("apiKeyHelper")
+        write_settings(settings)
+        st["effective"] = "max"
+        save_state(st)
+        log(f"INSTALL into {SETTINGS_PATH}")
+    print(f"installed into {SETTINGS_PATH} (backup in {BACKUP_DIR})")
+    if not os.path.exists(KEY_PATH):
+        print("next: store the API key with  claude-switch set-key")
+
+
+def cmd_uninstall():
+    with Locked():
+        settings = read_json(SETTINGS_PATH, {})
+        me = self_path()
+        if (settings.get("statusLine") or {}).get("command", "").startswith(me):
+            settings.pop("statusLine")
+        hooks = settings.get("hooks") or {}
+        for event in ("StopFailure", "Stop"):
+            kept = [h for h in hooks.get(event, []) if not any(me in (c.get("command") or "") for c in h.get("hooks", []))]
+            if kept:
+                hooks[event] = kept
+            else:
+                hooks.pop(event, None)
+        if not hooks:
+            settings.pop("hooks", None)
+        if settings.get("apiKeyHelper") == helper_cmd():
+            settings.pop("apiKeyHelper")
+        write_settings(settings)
+        st = load_state()
+        st["effective"] = "max"
+        save_state(st)
+        log(f"UNINSTALL from {SETTINGS_PATH}")
+    print(f"removed statusLine/hooks/apiKeyHelper from {SETTINGS_PATH} (backup in {BACKUP_DIR})")
+    print(f"state, logs and the key file remain in {SWITCH_HOME}; delete that directory yourself if wanted")
+
+
+USAGE = """usage: claude-switch <command>
+
+  status                 show mode, usage, spend, and what Claude Code actually resolves
+  set-mode auto|max|api  auto = switch on exhaustion/reset; max/api = force (also clears an API block)
+  set-key                store the Anthropic API key (reads stdin or hidden prompt), 0600
+  check [--quiet]        re-evaluate now (recovery time, spend limits)
+  log [N]                last N log lines (default 30)
+  install | uninstall    add/remove statusLine + hooks in ~/.claude/settings.json (backup first)
+
+  statusline | on-stop-failure | api-key   -- called by Claude Code, not by hand
+"""
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd, args = argv[0], argv[1:]
+    if cmd == "statusline":
+        cmd_statusline()
+    elif cmd == "on-stop-failure":
+        cmd_on_stop_failure()
+    elif cmd == "api-key":
+        cmd_api_key()
+    elif cmd == "check":
+        cmd_check(quiet="--quiet" in args)
+    elif cmd == "set-key":
+        cmd_set_key()
+    elif cmd == "set-mode":
+        cmd_set_mode(args[0] if args else "")
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "log":
+        cmd_log(int(args[0]) if args else 30)
+    elif cmd == "install":
+        cmd_install()
+    elif cmd == "uninstall":
+        cmd_uninstall()
+    else:
+        sys.exit(USAGE)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

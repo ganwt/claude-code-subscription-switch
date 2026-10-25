@@ -1,0 +1,7 @@
+# local-only
+.project-memory/
+.tmp/
+CLAUDE.local.md
+
+# generated
+__pycache__/
