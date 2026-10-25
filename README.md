@@ -1,12 +1,8 @@
 # claude-code-subscription-switch
 
-Command name: `claude-switch`.
+**中文** · [English](README.en.md) · [日本語](README.ja.md)
 
-Automatic switching for [Claude Code](https://code.claude.com) between your **Claude subscription** (Pro/Max/Team usage limits) and your own **Anthropic API key**: stay on the subscription while it has quota, fall over to the API key when a 5-hour or weekly window is exhausted, and fall back to the subscription when the window resets. Works for running sessions (CLI and the VS Code extension) without restarts, using only official Claude Code extension points (`statusLine`, `apiKeyHelper`, hooks). Linux / WSL; no dependencies beyond Python 3.
-
-以下为中文说明。
-
----
+命令名：`claude-switch`
 
 ## 它做什么
 
