@@ -69,6 +69,7 @@ Status bar examples: `MAX · 5h 42% ↻22:30 · 7d 12% ↻Mon 09:00` or `API · 
 | `rate_limit_guard_pct` | 80 | A `StopFailure rate_limit` counts as exhaustion only if the last known usage is at least this high, or usage data is stale — so an ordinary 429 is not mistaken for exhaustion |
 | `usage_stale_sec` | 900 | Usage data older than this is considered stale (e.g. extension-only sessions without a status line) |
 | `cooldown_sec` | 600 | Minimum interval before switching back to the subscription (anti-flapping) |
+| `unknown_reset_fallback_sec` | 18000 | How long to stay on the API when the error text carries no reset time (e.g. "You've reached your Fable limit") before trying the subscription again |
 | `api_daily_limit_usd` | 5.0 | Daily **soft** spend limit in API mode (client-side estimate at list price) |
 | `api_monthly_limit_usd` | 50.0 | Monthly soft spend limit |
 
@@ -113,8 +114,8 @@ bash tests/test.sh      # 12 scenarios in a temp dir: no real config, no network
 ## Known limitations
 
 - Switching happens between requests. The request that hits the limit fails, and Claude Code's auto-continue may enter its "waiting for reset" state; send a new message (or `/rate-limit-options`) and it continues with the new credential. Conversation history is preserved.
-- Whether the VS Code extension executes the `statusLine` command is unverified; hooks run in IDE extensions per the docs. If the extension does not run the status line, exhaustion detection there relies on `StopFailure rate_limit` and recovery on the `Stop` hook check, with no metering.
-- That a subscription usage-limit error surfaces as `StopFailure.error == rate_limit` is inferred from the docs; it was not verified without exhausting a real quota.
+- **The VS Code extension does not run the `statusLine`** (verified in real use); it does fire hooks. Extension sessions therefore get no proactive 95% switch: the request that hits the limit fails, `StopFailure` receives text like "You've hit your session limit · resets 3:30am", the tool switches immediately and parses the reset time from that text; recovery is driven by the `Stop` hook; API spend is not metered.
+- What is monitored are the account-wide 5-hour / 7-day windows. Model-specific limits ("You've reached your Fable limit") are usually not visible in the status line and are only caught through the error text, which carries no reset time, so the tool retries the subscription every `unknown_reset_fallback_sec`.
 - Linux / WSL only; native Windows Claude Code is not covered.
 
 ## Documents (Chinese)

@@ -13,10 +13,16 @@ import datetime as dt
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # python < 3.9
+    ZoneInfo = None
 
 HOME = os.path.expanduser("~")
 SWITCH_HOME = os.environ.get("CLAUDE_SWITCH_HOME") or os.path.join(HOME, ".config", "claude-switch")
@@ -26,6 +32,7 @@ CLAUDE_BIN = os.environ.get("CLAUDE_SWITCH_CLAUDE_BIN") or "claude"
 # "now" can be overridden for tests
 NOW = float(os.environ["CLAUDE_SWITCH_NOW"]) if os.environ.get("CLAUDE_SWITCH_NOW") else None
 
+HOOK_LOG_PATH = os.path.join(SWITCH_HOME, "log", "stopfailure.jsonl")
 STATE_PATH = os.path.join(SWITCH_HOME, "state.json")
 CONFIG_PATH = os.path.join(SWITCH_HOME, "config.json")
 KEY_PATH = os.path.join(SWITCH_HOME, "api_key")
@@ -42,6 +49,9 @@ DEFAULT_CONFIG = {
     "usage_stale_sec": 900,
     # minimum seconds between two switches (anti-flapping)
     "cooldown_sec": 600,
+    # how long to stay on the API when the subscription reset time is unknown
+    # (e.g. a model-specific limit error without a time in the message)
+    "unknown_reset_fallback_sec": 5 * 3600,
     # soft spend limits for API mode (client-side estimate, NOT a hard cap)
     "api_daily_limit_usd": 5.0,
     "api_monthly_limit_usd": 50.0,
@@ -209,6 +219,75 @@ def verify_async(want):
         pass
 
 
+# ---------------------------------------------------------------- rate-limit signals
+
+WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+RESET_RE = re.compile(
+    r"resets\s+(?:(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)(?:\s*\(([^)]+)\))?",
+    re.IGNORECASE)
+
+
+def parse_reset_time(msg):
+    """Epoch seconds for 'resets 3:30am (Asia/Tokyo)' / 'resets Mon 12:00am' in a limit message, else None."""
+    m = RESET_RE.search(msg or "")
+    if not m:
+        return None
+    wd, hh, mm, ampm, tzname = m.groups()
+    hour = int(hh) % 12 + (12 if ampm.lower() == "pm" else 0)
+    tz = None
+    if tzname and ZoneInfo:
+        try:
+            tz = ZoneInfo(tzname.strip())
+        except Exception:  # noqa: BLE001 - unknown zone, fall back to local time
+            tz = None
+    ref = dt.datetime.fromtimestamp(now(), tz) if tz else dt.datetime.fromtimestamp(now()).astimezone()
+    cand = ref.replace(hour=hour, minute=int(mm or 0), second=0, microsecond=0)
+    if wd:
+        days = (WEEKDAYS[wd.lower()[:3]] - cand.weekday()) % 7
+        cand += dt.timedelta(days=days)
+        if cand <= ref:
+            cand += dt.timedelta(days=7)
+    elif cand <= ref:
+        cand += dt.timedelta(days=1)
+    return int(cand.timestamp())
+
+
+def to_epoch(v):
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        try:
+            return int(dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def extract_windows(rl, model):
+    """Windows relevant to the current model from the statusline rate_limits object.
+
+    five_hour / seven_day are shared. seven_day_<family> and model_scoped[] are per model family
+    and only count when they belong to the model in use, so a Sonnet window never pushes a
+    Fable session onto the API key.
+    """
+    model_text = " ".join(str(v) for v in (model or {}).values()).lower()
+    out = {}
+    for k, v in (rl or {}).items():
+        if k == "model_scoped" and isinstance(v, list):
+            for e in v:
+                name = str((e or {}).get("display_name") or "")
+                if name and name.lower() in model_text and e.get("utilization") is not None:
+                    out[f"model:{name}"] = {"pct": e["utilization"], "resets_at": to_epoch(e.get("resets_at"))}
+            continue
+        if not isinstance(v, dict) or v.get("used_percentage") is None:
+            continue
+        family = k[len("seven_day_"):] if k.startswith("seven_day_") else None
+        if family and family not in ("oauth_apps",) and family not in model_text:
+            continue
+        out[k] = {"pct": v["used_percentage"], "resets_at": to_epoch(v.get("resets_at"))}
+    return out
+
+
 # ---------------------------------------------------------------- decision logic
 
 def spend(st, period):
@@ -219,7 +298,23 @@ def spend(st, period):
 
 
 def exhausted_windows(st, cfg):
-    return {k: v for k, v in st["usage"].items() if v.get("pct", 0) >= cfg["switch_pct"]}
+    """Windows at/above the threshold whose reset time has not passed yet.
+
+    A window without a known reset time is considered expired once the usage data is older
+    than unknown_reset_fallback_sec, so stale exhaustion never re-triggers a switch.
+    """
+    t = now()
+    out = {}
+    for k, v in st["usage"].items():
+        if v.get("pct", 0) < cfg["switch_pct"]:
+            continue
+        r = v.get("resets_at")
+        if r and r <= t:
+            continue
+        if not r and t - st["usage_at"] > cfg["unknown_reset_fallback_sec"]:
+            continue
+        out[k] = v
+    return out
 
 
 def evaluate(st, cfg, trigger):
@@ -258,7 +353,7 @@ def evaluate(st, cfg, trigger):
     ex = exhausted_windows(st, cfg)
     if ex and not st["api_blocked"]:
         resets = [v.get("resets_at") or 0 for v in ex.values()]
-        st["max_recover_at"] = max(resets) if any(resets) else t + 5 * 3600
+        st["max_recover_at"] = int(max(resets) if any(resets) else t + cfg["unknown_reset_fallback_sec"])
         desc = ", ".join(f"{k}={v.get('pct')}%" for k, v in ex.items())
         return apply_effective(st, "api", f"subscription exhausted: {desc}, recover at {fmt_time(st['max_recover_at'])} [{trigger}]")
     return False
@@ -280,11 +375,7 @@ def cmd_statusline():
     cfg = load_config()
     with Locked():
         st = load_state()
-        rl = data.get("rate_limits") or {}
-        windows = {}
-        for w in ("five_hour", "seven_day"):
-            if isinstance(rl.get(w), dict) and rl[w].get("used_percentage") is not None:
-                windows[w] = {"pct": rl[w]["used_percentage"], "resets_at": rl[w].get("resets_at")}
+        windows = extract_windows(data.get("rate_limits"), data.get("model"))
         # rate_limits only arrive while on the subscription; never let API-mode data clear them
         if windows and st["effective"] == "max":
             st["usage"] = windows
@@ -332,27 +423,41 @@ def cmd_on_stop_failure():
     except json.JSONDecodeError:
         return
     err = data.get("error") or "unknown"
-    detail = (data.get("last_assistant_message") or data.get("error_details") or "")[:200].replace("\n", " ")
+    msg = str(data.get("last_assistant_message") or "")
+    detail = (msg or str(data.get("error_details") or ""))[:200].replace("\n", " ")
     cfg = load_config()
     with Locked():
         st = load_state()
         log(f"STOPFAILURE error={err} effective={st['effective']} detail={detail!r}")
+        with open(HOOK_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": int(now()), **{k: data.get(k) for k in ("session_id", "error", "error_details", "last_assistant_message")}}) + "\n")
         if st["effective"] == "api" and err in ("authentication_failed", "billing_error", "account_on_hold", "invalid_request"):
             block_api(st, f"API error {err}")
             evaluate(st, cfg, "stop-failure")
         elif st["effective"] == "max" and st["mode"] == "auto" and err == "rate_limit":
+            # Claude Code renders subscription limits as "You've hit your session/weekly limit" or
+            # "You've reached your <Model> limit"; a plain API 429 does not say "your ... limit".
+            limit_msg = re.search(r"(hit|reached) your .*limit", msg, re.IGNORECASE) is not None
             stale = now() - st["usage_at"] > cfg["usage_stale_sec"]
             high = any(v.get("pct", 0) >= cfg["rate_limit_guard_pct"] for v in st["usage"].values())
-            if stale or high:
-                # trust the error: mark every known window exhausted so evaluate() switches
-                if not st["usage"]:
-                    st["usage"] = {"five_hour": {"pct": 100, "resets_at": None}}
-                for v in st["usage"].values():
-                    v["pct"] = max(v.get("pct", 0), 100)
+            if limit_msg or high or (stale and not msg):
+                reset_at = parse_reset_time(msg)
+                low = msg.lower()
+                named = re.search(r"your (\w+) limit", msg, re.IGNORECASE)
+                if "weekly" in low:
+                    key = "seven_day"
+                elif "session" in low or not named:
+                    key = "five_hour"
+                else:
+                    key = f"model:{named.group(1)}"      # e.g. "You've reached your Fable limit"
+                if reset_at is None:
+                    reset_at = (st["usage"].get(key) or {}).get("resets_at")   # keep a known reset time
+                st["usage"][key] = {"pct": 100, "resets_at": reset_at}
                 st["usage_at"] = now()
-                evaluate(st, cfg, f"stop-failure rate_limit{' (usage data stale)' if stale else ''}")
+                why = "limit message" if limit_msg else ("usage >= guard" if high else "usage data stale")
+                evaluate(st, cfg, f"stop-failure rate_limit ({why}{', reset time parsed' if reset_at else ', reset time unknown'})")
             else:
-                log("rate_limit ignored: last known usage below guard threshold")
+                log("rate_limit ignored: not a usage-limit message and last known usage below guard threshold")
         save_state(st)
 
 

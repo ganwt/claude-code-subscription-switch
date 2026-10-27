@@ -69,6 +69,7 @@ claude-switch check             # 今すぐ再評価
 | `rate_limit_guard_pct` | 80 | `StopFailure rate_limit` を「上限到達」とみなすのは、直近の既知使用率がこの値以上、または使用率データが古い場合のみ。通常の 429 を誤認しないため |
 | `usage_stale_sec` | 900 | 使用率データがこの秒数より古ければ「古い」とみなす（ステータスラインのない拡張のみの利用など） |
 | `cooldown_sec` | 600 | サブスクリプションへ戻すまでの最小間隔（フラッピング防止） |
+| `unknown_reset_fallback_sec` | 18000 | エラー文にリセット時刻がない場合（例: "You've reached your Fable limit"）、API モードに留まってから再度サブスクリプションを試すまでの秒数 |
 | `api_daily_limit_usd` | 5.0 | API モードの 1 日あたり**ソフト**上限（クライアント側の定価見積もり） |
 | `api_monthly_limit_usd` | 50.0 | 月間ソフト上限 |
 
@@ -113,8 +114,8 @@ bash tests/test.sh      # 一時ディレクトリで 12 シナリオを実行�
 ## 既知の制限
 
 - 切替はリクエストとリクエストの間で行われます。上限に達したそのリクエスト自体は失敗し、Claude Code の auto-continue が「リセット待ち」状態に入ることがあります。新しいメッセージを送る（または `/rate-limit-options`）と新しい認証で続行します。会話履歴は保持されます。
-- VS Code 拡張が `statusLine` コマンドを実行するかは未検証です。フックはドキュメント上 IDE 拡張でも動作します。拡張がステータスラインを実行しない場合、拡張側の上限検知は `StopFailure rate_limit` のみ、復帰は `Stop` フックのチェックに頼り、計測は行われません。
-- サブスクリプションの上限エラーが `StopFailure.error == rate_limit` として現れることはドキュメントからの推定で、実際に上限を使い切っての検証はしていません。
+- **VS Code 拡張は `statusLine` を実行しません**（実使用で確認済み）。フックは発火します。そのため拡張のセッションでは 95% での先回り切替は行われず、上限に達したリクエストが失敗した時点で `StopFailure` が "You've hit your session limit · resets 3:30am" のような文を受け取り、即座に切り替えてその文からリセット時刻を解析します。復帰は `Stop` フックのチェックで行われ、API 支出は計測されません。
+- 監視対象はアカウント共通の 5 時間 / 7 日ウィンドウです。モデル固有の上限（"You've reached your Fable limit"）は通常ステータスラインには現れず、エラー文からのみ検知します。この文にはリセット時刻がないため、`unknown_reset_fallback_sec` ごとにサブスクリプションを再試行します。
 - Linux / WSL のみ対応。Windows ネイティブの Claude Code は対象外です。
 
 ## ドキュメント（中国語）

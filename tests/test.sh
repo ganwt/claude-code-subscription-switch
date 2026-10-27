@@ -40,7 +40,10 @@ if pct != "-":
 print(json.dumps(d))
 PY
 }
-sf() { printf '{"hook_event_name":"StopFailure","error":"%s","last_assistant_message":"API Error: x"}' "$1" | "$CS" on-stop-failure; }
+sf() { # sf <error> [message]  -> feed a StopFailure hook JSON
+  python3 -c 'import json,sys; print(json.dumps({"hook_event_name":"StopFailure","error":sys.argv[1],"last_assistant_message":sys.argv[2] if len(sys.argv)>2 else "API Error: x"}))' "$@" | "$CS" on-stop-failure; }
+slm() { # slm <model_display_name> <rate_limits_json> <session>  -> statusline with arbitrary rate_limits
+  python3 -c 'import json,sys; print(json.dumps({"session_id":sys.argv[3],"cost":{"total_cost_usd":0},"model":{"id":"x","display_name":sys.argv[1]},"rate_limits":json.loads(sys.argv[2])}))' "$@" | "$CS" statusline; }
 export CS; export -f has_helper no_helper effective field   # used inside `bash -c` checks
 
 T0=1800000000            # fixed "now"
@@ -136,7 +139,33 @@ check "recover from known resets_at"        bash -c '[ "$(field max_recover_at)"
 export CLAUDE_SWITCH_NOW=$((T0+100000+5000))       # usage now stale (>900s)
 "$CS" set-mode auto >/dev/null
 sf rate_limit
-check "rate_limit with stale usage switches" bash -c '[ "$(effective)" = api ]'
+check "generic rate_limit with stale usage ignored" bash -c '[ "$(effective)" = max ]'
+sf rate_limit "You've hit your session limit · resets 3:30am (Asia/Tokyo)"
+check "session-limit message switches"      bash -c '[ "$(effective)" = api ]'
+EXPECT=$(python3 -c 'import datetime,zoneinfo,os; tz=zoneinfo.ZoneInfo("Asia/Tokyo"); n=datetime.datetime.fromtimestamp(float(os.environ["CLAUDE_SWITCH_NOW"]),tz); c=n.replace(hour=3,minute=30,second=0,microsecond=0); c=c+datetime.timedelta(days=1) if c<=n else c; print(int(c.timestamp()))')
+check "reset time parsed from message"      bash -c '[ "$(field max_recover_at)" = "$1" ]' _ "$EXPECT"
+T8a=$((EXPECT+1)); export CLAUDE_SWITCH_NOW=$T8a; "$CS" check >/dev/null   # parsed reset passed
+check "back to max at parsed reset"         bash -c '[ "$(effective)" = max ]'
+sl 10 $((T8a+3600)) s5b 0 >/dev/null
+sf rate_limit "You've reached your Fable limit. Switch to another model to continue."
+check "model-limit message switches even at 10%" bash -c '[ "$(effective)" = api ]'
+check "unknown reset -> fallback 5h"        bash -c '[ "$(field max_recover_at)" = '"$((T8a+18000))"' ]'
+export CLAUDE_SWITCH_NOW=$((T8a+18001))   # fallback window elapsed
+"$CS" check >/dev/null
+check "fallback elapsed -> back to max"     bash -c '[ "$(effective)" = max ]'
+"$CS" set-mode max >/dev/null; "$CS" set-mode auto >/dev/null
+check "stale exhaustion does not re-trigger" bash -c '[ "$(effective)" = max ]'
+sf rate_limit "You've hit your weekly limit · resets Mon 12:00am (Asia/Tokyo)"
+check "weekly message -> seven_day window"  bash -c 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d[\"effective\"]==\"api\" and d[\"usage\"][\"seven_day\"][\"pct\"]==100 and d[\"usage\"][\"seven_day\"][\"resets_at\"]" "$CLAUDE_SWITCH_HOME/state.json"'
+
+echo "# scenario 8b: model-scoped windows in statusline only count for the model in use"
+T8=$((T0+900000)); export CLAUDE_SWITCH_NOW=$T8; "$CS" check >/dev/null      # weekly reset long passed
+check "back to max after weekly reset"      bash -c '[ "$(effective)" = max ]'
+slm "Fable 5.1" '{"five_hour":{"used_percentage":10,"resets_at":'"$((T8+3600))"'},"seven_day_sonnet":{"used_percentage":100,"resets_at":'"$((T8+86400))"'}}' s8 >/dev/null
+check "sonnet window ignored on Fable"      bash -c '[ "$(effective)" = max ]'
+slm "Fable 5.1" '{"five_hour":{"used_percentage":10,"resets_at":'"$((T8+3600))"'},"model_scoped":[{"display_name":"Fable","utilization":100,"resets_at":'"$((T8+86400))"'}]}' s8 >/dev/null
+check "Fable model_scoped window switches"  bash -c '[ "$(effective)" = api ] && [ "$(field max_recover_at)" = '"$((T8+86400))"' ]'
+export CLAUDE_SWITCH_NOW=$((T8+86401)); "$CS" check >/dev/null
 
 echo "# scenario 9: forced modes"
 "$CS" set-mode max >/dev/null

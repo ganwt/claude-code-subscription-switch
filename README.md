@@ -71,6 +71,7 @@ claude-switch check             # 立即重新评估
 | `rate_limit_guard_pct` | 80 | `StopFailure rate_limit` 只有在最近已知用量 ≥ 此值、或用量数据过期时才视为限额耗尽，避免把普通 429 当成耗尽 |
 | `usage_stale_sec` | 900 | 用量数据超过这么久没更新就视为过期（例如只用扩展、没有状态栏的情况） |
 | `cooldown_sec` | 600 | 切回订阅的最小间隔，防抖 |
+| `unknown_reset_fallback_sec` | 18000 | 错误文本里没有重置时间（如 "You've reached your Fable limit"）时，在 API 模式停留多久再尝试切回 |
 | `api_daily_limit_usd` | 5.0 | API 模式每日**软**上限（客户端按标价估算） |
 | `api_monthly_limit_usd` | 50.0 | API 模式每月软上限 |
 
@@ -115,8 +116,8 @@ bash tests/test.sh      # 在临时目录里跑 12 组场景，不碰真实配�
 ## 已知限制
 
 - 切换发生在请求之间：限额命中的那一轮请求本身会失败，Claude Code 的 auto-continue 可能进入"等待重置"状态，此时发一条新消息（或 `/rate-limit-options`）即可用新认证继续；会话历史完整保留。
-- VS Code 扩展是否执行 `statusLine` 命令尚未验证；hooks 按文档在 IDE 扩展里生效。若扩展不跑 statusLine，扩展侧的耗尽检测只能靠 `StopFailure rate_limit`，恢复靠 `Stop` hook 的检查，且不计费。
-- 订阅限额命中时 `StopFailure.error` 是否为 `rate_limit` 来自文档推断，未在不耗尽真实限额的情况下验证。
+- **VS Code 扩展不执行 `statusLine`**（真实使用验证），只触发 hooks。扩展会话因此没有 95% 提前切换：耗尽时那一次请求会失败，`StopFailure` 收到 "You've hit your session limit · resets 3:30am" 之类的文本后立即切换，并从文本解析重置时间；恢复由 `Stop` hook 检查；API 花费不计量。
+- 监控的是账号共享的 5 小时 / 7 天窗口。模型专属限额（"You've reached your Fable limit"）在 statusLine 里通常不可见，只能通过错误文本捕获，且文本不含重置时间，会按 `unknown_reset_fallback_sec` 周期性尝试切回。
 - 只覆盖 Linux / WSL；Windows 原生 Claude Code 未处理。
 
 ## 文档
